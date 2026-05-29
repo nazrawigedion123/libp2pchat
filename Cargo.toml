@@ -5,7 +5,7 @@ edition = "2024"
 
 
 [dependencies]
-libp2p = { version = "0.54", features = ["gossipsub", "mdns", "tcp", "macros", "tokio", "noise", "yamux", "quic",  "identify"] }
+libp2p = { version = "0.54", features = ["gossipsub", "mdns", "tcp", "macros", "tokio", "noise", "yamux", "quic",  "identify","kad"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

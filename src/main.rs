@@ -181,7 +181,7 @@
 // }
 use futures::stream::StreamExt;
 use libp2p::{
-    gossipsub, identify, mdns, noise,
+    gossipsub, identify, kad, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
@@ -208,23 +208,30 @@ struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
+    kademlia: kad::Behaviour<kad::store::MemoryStore>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
+        eprintln!("Usage:");
+        eprintln!("  As Bootstrap Node A:");
         eprintln!(
-            "Usage: cargo run -- <local_proxy_port> <public_listen_port> <remote_target_ip:port>"
+            "    cargo run -- <local_proxy_port> <public_listen_port> <remote_target_ip:port> bootstrap"
         );
-        eprintln!("Example Node A: cargo run -- 8500 9500 127.0.0.1:9501");
-        eprintln!("Example Node B: cargo run -- 8501 9501 127.0.0.1:9500");
+        eprintln!("  As Peer Node B:");
+        eprintln!(
+            "    cargo run -- <local_proxy_port> <public_listen_port> <remote_target_ip:port> /ip4/127.0.0.1/tcp/8500/p2p/<BOOTSTRAP_PEER_ID>"
+        );
         std::process::exit(1);
     }
 
     let local_proxy_port: i32 = args[1].parse().unwrap();
     let public_router_port: i32 = args[2].parse().unwrap();
     let remote_peer_internet_addr = args[3].clone();
+
+    let bootstrap_mode = args.get(4).map(|s| s.as_str());
 
     println!("[Rust] Spin up Go P2P Tunnel in background...");
     thread::spawn(move || {
@@ -253,6 +260,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             yamux::Config::default,
         )?
         .with_behaviour(|key| {
+            let peer_id = key.public().to_peer_id();
             let message_id_fn = |message: &gossipsub::Message| {
                 let mut s = DefaultHasher::new();
                 message.data.hash(&mut s);
@@ -280,10 +288,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 key.public(),
             ));
 
+            //kadima
+            let store = kad::store::MemoryStore::new(peer_id);
+            // let kad_config = kad::Config::default();
+            let kademlia = kad::Behaviour::new(peer_id, store);
+
             Ok(MyBehaviour {
                 gossipsub,
                 mdns,
                 identify,
+                kademlia,
             })
         })?
         .build();
@@ -293,25 +307,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
 
-    // let listen_multiaddr = format!("/ip4/127.0.0.1/tcp/{}", local_proxy_port).parse()?;
-    // swarm.listen_on(listen_multiaddr)?;
-    // println!("[Rust] libp2p stack bound to local VPN interface.");
-    let listen_multiaddr = format!("/ip4/127.0.0.1/tcp/{}", local_proxy_port).parse()?;
+    
+    let topic = gossipsub::IdentTopic::new("test-net");
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
+    let mut stdin = io::BufReader::new(io::stdin()).lines();
+  
+    let listen_multiaddr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", local_proxy_port).parse()?;
     swarm.listen_on(listen_multiaddr)?;
+    // println!("Dialing remote libp2p node at {remote_libp2p_addr}");
+    println!("[Rust] Local Peer ID: {}", swarm.local_peer_id());
+    // handle boot starp mode
+    match bootstrap_mode {
+        Some("bootstrap") => {
+            println!(
+                "[Kademlia] Node is running as the Bootstrap point. Waiting for connections..."
+            );
+        }
+        Some(addr_str) => {
+            let bootstrap_addr: libp2p::Multiaddr = addr_str.parse()?;
 
-    println!("[Rust] libp2p stack bound to local VPN interface.");
+            // Extract peer ID from the multiaddress string (expects format like /ip4/.../p2p/PeerId)
+            if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) = bootstrap_addr.iter().last() {
+                println!("[Kademlia] Seeding routing table with Bootstrap node: {peer_id}");
 
-    let remote_libp2p_addr = if local_proxy_port == 8500 {
-        "/ip4/127.0.0.1/tcp/8501"
-    } else {
-        "/ip4/127.0.0.1/tcp/8500"
-    };
+                // Add the bootstrap node address into Kademlia
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, bootstrap_addr.clone());
 
-    let remote_addr: libp2p::Multiaddr = remote_libp2p_addr.parse()?;
-
-    swarm.dial(remote_addr)?;
-    println!("Dialing remote libp2p node at {remote_libp2p_addr}");
+                // Trigger the actual discovery phase
+                swarm.behaviour_mut().kademlia.bootstrap()?;
+            } else {
+                eprintln!(
+                    "[Error] Provided bootstrap multiaddress must contain the trailing /p2p/<PeerId>"
+                );
+                std::process::exit(1);
+            }
+        }
+        None => {
+            println!("[Warning] No bootstrapping mode provided. Operating in isolation mode.");
+        }
+    }
 
     loop {
         select! {
