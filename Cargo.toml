@@ -1,0 +1,12 @@
+[package]
+name = "libp2p-chat"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+libp2p = { version = "0.54", features = ["gossipsub", "mdns", "tcp", "macros", "tokio", "noise", "yamux", "quic",  "identify"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
