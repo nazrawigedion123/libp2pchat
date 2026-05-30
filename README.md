@@ -5,6 +5,45 @@ Here's a comprehensive documentation for your Rust/libp2p VPN tunneling applicat
 ## Overview
 This application creates a P2P VPN tunnel using libp2p as the control plane and a Go-based VPN tunnel as the data plane. It provides a decentralized networking solution with automatic peer discovery, NAT traversal capabilities, and robust protocol negotiation.
 
+## Exact Commands
+
+Run these in two terminals for local testing.
+
+### Terminal 1: Bootstrap Node A
+
+```bash
+RUST_LOG=info cargo run -- 8500 9500 127.0.0.1:9501 bootstrap
+```
+
+After it starts, copy the peer ID from this line:
+
+```text
+[Rust] Local Peer ID: <BOOTSTRAP_PEER_ID>
+```
+
+The bootstrap node listens on both:
+
+```text
+/ip4/127.0.0.1/tcp/8500
+/ip4/127.0.0.1/udp/8500/quic-v1
+```
+
+### Terminal 2: Peer Node B
+
+Replace `<BOOTSTRAP_PEER_ID>` with the peer ID printed by Terminal 1:
+
+```bash
+RUST_LOG=info cargo run -- 8501 9501 127.0.0.1:9500 /ip4/127.0.0.1/tcp/8500/p2p/<BOOTSTRAP_PEER_ID>
+```
+
+You can also bootstrap over the QUIC address:
+
+```bash
+RUST_LOG=info cargo run -- 8501 9501 127.0.0.1:9500 /ip4/127.0.0.1/udp/8500/quic-v1/p2p/<BOOTSTRAP_PEER_ID>
+```
+
+For two machines, replace `127.0.0.1` in the bootstrap multiaddr with the bootstrap machine's reachable IP address, and make sure the TCP/UDP port is open.
+
 ## Architecture Diagram
 ```
 ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
@@ -31,14 +70,16 @@ struct MyBehaviour {
     mdns: mdns::tokio::Behaviour, // Local network discovery
     identify: identify::Behaviour, // Protocol negotiation
     kademlia: kad::Behaviour<...>, // DHT for peer routing
+    dcutr: dcutr::Behaviour, // Direct connection upgrade / hole punching
 }
 ```
 
-**Purpose**: Combines four libp2p protocols into a single network behaviour:
+**Purpose**: Combines libp2p protocols into a single network behaviour:
 - **Gossipsub**: Topic-based message broadcasting
 - **mDNS**: Automatic peer discovery on local network
 - **Identify**: Protocol version and capability negotiation
 - **Kademlia**: Distributed Hash Table for peer routing in larger networks
+- **DCUtR**: Direct connection upgrade support for hole punching after peers meet through a relay
 
 ### 2. **FFI Bridge to Go VPN Tunnel**
 ```rust
@@ -72,10 +113,10 @@ if args.len() < 4 {
 **Usage Examples**:
 ```bash
 # Bootstrap Node
-cargo run -- 8080 9000 "remote.server.com:51820" bootstrap
+cargo run -- 8500 9500 127.0.0.1:9501 bootstrap
 
 # Peer Node
-cargo run -- 8080 9000 "remote.server.com:51820" "/ip4/127.0.0.1/tcp/8500/p2p/12D3KooW..."
+cargo run -- 8501 9501 127.0.0.1:9500 /ip4/127.0.0.1/tcp/8500/p2p/<BOOTSTRAP_PEER_ID>
 ```
 
 ### Step 2: Go VPN Tunnel Initialization
@@ -107,6 +148,7 @@ let mut swarm = libp2p::SwarmBuilder::with_new_identity()
 
 #### Transport Layer:
 - **TCP**: Reliable stream transport
+- **QUIC**: UDP-based encrypted multiplexed transport
 - **Noise**: Secure channel encryption
 - **Yamux**: Stream multiplexing
 
@@ -234,10 +276,16 @@ Event	Meaning	Visual Indicator
 
 ```bash
 # Terminal 1 - Bootstrap Node (Peer A)
-RUST_LOG=info cargo run -- 8080 9000 "10.0.0.1:51820" bootstrap
+RUST_LOG=info cargo run -- 8500 9500 127.0.0.1:9501 bootstrap
+
+# Copy the peer ID printed by Node A:
+# [Rust] Local Peer ID: <BOOTSTRAP_PEER_ID>
 
 # Terminal 2 - Peer Node (Peer B)
-RUST_LOG=info cargo run -- 8081 9001 "10.0.0.1:51820" "/ip4/127.0.0.1/tcp/8080/p2p/QmBootstrapPeerID"
+RUST_LOG=info cargo run -- 8501 9501 127.0.0.1:9500 /ip4/127.0.0.1/tcp/8500/p2p/<BOOTSTRAP_PEER_ID>
+
+# Optional QUIC bootstrap address for Peer B
+RUST_LOG=info cargo run -- 8501 9501 127.0.0.1:9500 /ip4/127.0.0.1/udp/8500/quic-v1/p2p/<BOOTSTRAP_PEER_ID>
 
 # Send messages
 > Hello VPN Network!
