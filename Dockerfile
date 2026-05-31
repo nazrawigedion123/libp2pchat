@@ -1,6 +1,6 @@
 # --- Build Stage ---
-# Changed from 1.75 to 1.85+ to support Rust Edition 2024
-FROM rust:1.85-bookworm AS builder
+# Changed from 1.85 to latest to satisfy crates demanding Rust 1.88+
+FROM rust:latest AS builder
 WORKDIR /usr/src/app
 
 # Install standard build tools for C bindings
@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y build-essential clang
 COPY . .
 
 # Ensure your static library "libgovpn.a" location can be found by the linker
-# Adjust "native=" to point to the exact relative directory of your .a file if it's inside /vpn
 ENV RUSTFLAGS="-L native=/usr/src/app/vpn"
 
 RUN cargo build --release
