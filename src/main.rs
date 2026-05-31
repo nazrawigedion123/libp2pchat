@@ -1,10 +1,17 @@
+mod db;
+mod identity;
+
+use db::PeerStorage;
+use directories::ProjectDirs;
 use futures::stream::StreamExt;
 use libp2p::{
     Swarm, dcutr, gossipsub, identify, kad, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
+use std::fs;
 use std::os::raw::c_char;
+use std::path::PathBuf;
 use std::thread;
 use std::{env, ffi::CString};
 use std::{error::Error, time::Duration};
@@ -25,6 +32,7 @@ struct MyBehaviour {
 }
 
 struct AppConfig {
+    node_name: String, // e.g. "node1" or "node2"
     local_proxy_port: i32,
     public_router_port: i32,
     remote_peer_internet_addr: String,
@@ -35,6 +43,19 @@ struct AppConfig {
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = parse_args();
 
+    // 1. Setup isolation directories under ~/.myapp/<node_name>
+    let mut node_dir = ProjectDirs::from("", "", "myapp")
+        .map(|p| p.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    node_dir.push(&config.node_name);
+    fs::create_dir_all(&node_dir)?;
+
+    // 2. Load or generate persistent identity
+    let id_keys = identity::load_or_generate_identity(&node_dir)?;
+    
+    // 3. Initialize SQL storage
+    let db = PeerStorage::init(&node_dir)?;
+
     start_go_vpn_tunnel(
         config.local_proxy_port,
         config.public_router_port,
@@ -43,29 +64,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let mut swarm = build_swarm()?;
+    // 4. Build swarm using the cryptographic keypair
+    let mut swarm = build_swarm(&id_keys)?;
     let topic = subscribe_to_chat_topic(&mut swarm)?;
+
+    // 5. Hydrate Kademlia routing table with peers saved inside peer.db
+    let old_peers = db.load_all_peers()?;
+    println!("Loaded {} history peer connection(s) from SQL database.", old_peers.len());
+    for (peer_id, addr) in old_peers {
+        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+    }
 
     listen_on_local_transports(&mut swarm, config.local_proxy_port)?;
 
     println!("Local Peer ID: {}", swarm.local_peer_id());
     configure_bootstrap(&mut swarm, config.bootstrap_mode.as_deref())?;
 
-    run_chat_event_loop(swarm, topic).await
+    run_chat_event_loop(swarm, topic, db).await
 }
 
 fn parse_args() -> AppConfig {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 {
+    if args.len() < 5 {
         print_usage();
         std::process::exit(1);
     }
 
     AppConfig {
-        local_proxy_port: args[1].parse().unwrap(),
-        public_router_port: args[2].parse().unwrap(),
-        remote_peer_internet_addr: args[3].clone(),
-        bootstrap_mode: args.get(4).cloned(),
+        node_name: args[1].clone(),
+        local_proxy_port: args[2].parse().unwrap(),
+        public_router_port: args[3].parse().unwrap(),
+        remote_peer_internet_addr: args[4].clone(),
+        bootstrap_mode: args.get(5).cloned(),
     }
 }
 
@@ -73,11 +103,11 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  As Bootstrap Node A:");
     eprintln!(
-        "    cargo run -- <local_proxy_port> <public_listen_port> <remote_target_ip:port> bootstrap"
+        "    cargo run -- <node_name> <local_proxy_port> <public_listen_port> <remote_target_ip:port> bootstrap"
     );
     eprintln!("  As Peer Node B:");
     eprintln!(
-        "    cargo run -- <local_proxy_port> <public_listen_port> <remote_target_ip:port> /ip4/127.0.0.1/tcp/8500/p2p/<BOOTSTRAP_PEER_ID>"
+        "    cargo run -- <node_name> <local_proxy_port> <public_listen_port> <remote_target_ip:port> /ip4/.../p2p/<BOOTSTRAP_PEER_ID>"
     );
 }
 
@@ -99,8 +129,8 @@ fn start_go_vpn_tunnel(
     });
 }
 
-fn build_swarm() -> Result<Swarm<MyBehaviour>, Box<dyn Error>> {
-    let swarm = libp2p::SwarmBuilder::with_new_identity()
+fn build_swarm(key: &libp2p::identity::Keypair) -> Result<Swarm<MyBehaviour>, Box<dyn Error>> {
+    let swarm = libp2p::SwarmBuilder::with_existing_identity(key.clone())
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -108,7 +138,7 @@ fn build_swarm() -> Result<Swarm<MyBehaviour>, Box<dyn Error>> {
             yamux::Config::default,
         )?
         .with_quic()
-        .with_behaviour(build_behaviour)?
+        .with_behaviour(|k| build_behaviour(k))?
         .build();
 
     Ok(swarm)
@@ -201,6 +231,7 @@ fn configure_bootstrap(
 async fn run_chat_event_loop(
     mut swarm: Swarm<MyBehaviour>,
     topic: gossipsub::IdentTopic,
+    db: PeerStorage,
 ) -> Result<(), Box<dyn Error>> {
     let mut stdin = io::BufReader::new(io::stdin()).lines();
 
@@ -211,21 +242,33 @@ async fn run_chat_event_loop(
                     .behaviour_mut().gossipsub
                     .publish(topic.clone(), line.as_bytes());
             }
-            event = swarm.select_next_some() => handle_swarm_event(event)
+            event = swarm.select_next_some() => handle_swarm_event(&mut swarm, event, &db)
         }
     }
 }
+fn handle_swarm_event(swarm: &mut Swarm<MyBehaviour>, event: SwarmEvent<MyBehaviourEvent>, db: &PeerStorage) {
+    match event {
+        SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            propagation_source: peer_id,
+            message,
+            ..
+        })) => {
+            println!("[{}] {}", peer_id, String::from_utf8_lossy(&message.data));
+        }
 
-fn handle_swarm_event(event: SwarmEvent<MyBehaviourEvent>) {
-    if let SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-        propagation_source: peer_id,
-        message,
-        ..
-    })) = event {
-        println!(
-            "[{}] {}",
-            peer_id,
-            String::from_utf8_lossy(&message.data),
-        );
+        // Added `connection_id` (ignored via `..`) to match the updated enum variant structure
+        SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { 
+            peer_id, 
+            info,
+            .. // This implicitly handles connection_id and any future fields
+        })) => {
+            for addr in info.listen_addrs {
+                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                if let Err(e) = db.save_peer(&peer_id, &addr) {
+                    eprintln!("Database write failure: {e}");
+                }
+            }
+        }
+        _ => {}
     }
 }
