@@ -5,9 +5,20 @@ use db::PeerStorage;
 use directories::ProjectDirs;
 use futures::stream::StreamExt;
 use libp2p::{
-    Swarm, Transport, autonat, dcutr, gossipsub, identify, kad, mdns, noise, relay,
+    Swarm,
+    Transport,
+    autonat,
+    dcutr,
+    gossipsub,
+    identify,
+    kad,
+    mdns,
+    noise,
+    relay,
+    request_response, // <-- Added for point-to-point communication
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
+    tcp,
+    yamux,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -48,6 +59,8 @@ enum Message {
 #[derive(NetworkBehaviour)]
 struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
+    // Add the direct point-to-point request-response protocol behavior
+    direct_messaging: request_response::cbor::Behaviour<Message, Message>,
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
@@ -68,9 +81,9 @@ struct AppConfig {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = parse_args();
-    // In main.rs:
+
     let mut node_dir = if std::env::var("FLY_APP_NAME").is_ok() {
-        PathBuf::from("/data") // Force production Fly.io volume path
+        PathBuf::from("/data")
     } else {
         ProjectDirs::from("", "", "myapp")
             .map(|p| p.data_dir().to_path_buf())
@@ -79,17 +92,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     node_dir.push(&config.node_name);
     fs::create_dir_all(&node_dir)?;
 
-    // // 1. Setup isolation directories under ~/.myapp/<node_name>
-    // let mut node_dir = ProjectDirs::from("", "", "myapp")
-    //     .map(|p| p.data_dir().to_path_buf())
-    //     .unwrap_or_else(|| PathBuf::from("."));
-    // node_dir.push(&config.node_name);
-    // fs::create_dir_all(&node_dir)?;
-
-    // 2. Load or generate persistent identity
     let id_keys = identity::load_or_generate_identity(&node_dir)?;
-
-    // 3. Initialize SQL storage
     let db = PeerStorage::init(&node_dir)?;
 
     start_go_vpn_tunnel(
@@ -100,18 +103,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // 4. Build swarm using the cryptographic keypair
     let mut swarm = build_swarm(&id_keys)?;
     let topic = subscribe_to_chat_topic(&mut swarm)?;
 
-    // 5. Hydrate Kademlia routing table with peers saved inside peer.db
     let old_peers = db.load_all_peers()?;
     println!(
         "Loaded {} history peer connection(s) from SQL database.",
         old_peers.len()
     );
     for (peer_id, addr) in old_peers {
-        // Skip malformed circuit proxies to avoid triggering MissingDstPeerId
         if addr.to_string().contains("/p2p-circuit") && !addr.to_string().contains("/p2p/") {
             continue;
         }
@@ -210,6 +210,15 @@ fn build_behaviour(
         gossipsub_config,
     )?;
 
+    // Configure Direct request/response channel settings
+    // Configure Direct request/response channel settings using StreamProtocol
+    let direct_messaging = request_response::cbor::Behaviour::new(
+        [(
+            libp2p::StreamProtocol::new("/direct-app-proto/1.0.0"),
+            request_response::ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    );
     let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
     let identify = identify::Behaviour::new(identify::Config::new(
@@ -225,6 +234,7 @@ fn build_behaviour(
 
     Ok(MyBehaviour {
         gossipsub,
+        direct_messaging,
         mdns,
         identify,
         kademlia,
@@ -247,10 +257,11 @@ fn listen_on_local_transports(
     swarm: &mut Swarm<MyBehaviour>,
     local_proxy_port: i32,
 ) -> Result<(), Box<dyn Error>> {
+    // Change 127.0.0.1 to 0.0.0.0 so libp2p can capture outside network interfaces
     let tcp_listen_multiaddr: libp2p::Multiaddr =
-        format!("/ip4/127.0.0.1/tcp/{}", local_proxy_port).parse()?;
+        format!("/ip4/0.0.0.0/tcp/{}", local_proxy_port).parse()?;
     let quic_listen_multiaddr: libp2p::Multiaddr =
-        format!("/ip4/127.0.0.1/udp/{}/quic-v1", local_proxy_port).parse()?;
+        format!("/ip4/0.0.0.0/udp/{}/quic-v1", local_proxy_port).parse()?;
 
     swarm.listen_on(tcp_listen_multiaddr)?;
     swarm.listen_on(quic_listen_multiaddr)?;
@@ -269,7 +280,13 @@ fn configure_bootstrap(
                     .behaviour_mut()
                     .kademlia
                     .add_address(&peer_id, bootstrap_addr.clone());
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .add_explicit_peer(&peer_id);
+                swarm.dial(bootstrap_addr.clone())?;
                 swarm.behaviour_mut().kademlia.bootstrap()?;
+                println!("Dialing bootstrap peer {peer_id} at {bootstrap_addr}");
             } else {
                 eprintln!(
                     "Error: Provided bootstrap multiaddress must contain the trailing /p2p/<PeerId>"
@@ -291,7 +308,26 @@ async fn run_chat_event_loop(
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
-                // Parse commands to demonstrate all protocol message variants, defaulting to Chat
+                // Command layout pattern lookup: /direct <TARGET_PEER_ID> <YOUR CHAT TEXT HERE>
+                if line.starts_with("/direct ") {
+                    let parts: Vec<&str> = line.trim_start_matches("/direct ").splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        if let Ok(target_peer_id) = parts[0].parse::<libp2p::PeerId>() {
+                            let direct_msg = Message::Chat(parts[1].to_string());
+
+                            // Send direct query request over the tracking pipeline
+                            swarm.behaviour_mut().direct_messaging.send_request(&target_peer_id, direct_msg);
+                            println!("=> Direct message request sent to {}", target_peer_id);
+                        } else {
+                            eprintln!("System: Invalid target Peer ID format input string.");
+                        }
+                    } else {
+                        eprintln!("System Usage: /direct <PEER_ID> <MESSAGE>");
+                    }
+                    continue;
+                }
+
+                // Default fallback fallback paths parse standard gossip mesh commands
                 let app_msg = if line.starts_with("/rpc ") {
                     Message::RPC {
                         method: line.trim_start_matches("/rpc ").to_string(),
@@ -314,7 +350,6 @@ async fn run_chat_event_loop(
                     Message::Chat(line)
                 };
 
-                // Serialize using bincode to convert our Message enum to a byte stream
                 match bincode::serialize(&app_msg) {
                     Ok(encoded_bytes) => {
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded_bytes) {
@@ -335,60 +370,69 @@ fn handle_swarm_event(
     db: &PeerStorage,
 ) {
     match event {
+        // --- Core Application Protocol (Gossipsub Broadcasts) ---
         SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source: peer_id,
             message,
             ..
+        })) => match bincode::deserialize::<Message>(&message.data) {
+            Ok(app_message) => {
+                display_received_message("Gossip Mesh Network", peer_id, app_message)
+            }
+            Err(_) => println!(" [{peer_id}] Received untyped binary text chunk via Gossipsub"),
+        },
+        SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
+            peer_id,
+            topic,
         })) => {
-            // Deserialize bytes back into our structured Message enum
-            match bincode::deserialize::<Message>(&message.data) {
-                Ok(app_message) => match app_message {
-                    Message::Chat(text) => {
-                        println!(" [{peer_id}] (Chat): {text}");
-                    }
-                    Message::FileChunk {
-                        file_name,
-                        chunk_index,
-                        data,
-                    } => {
-                        println!(
-                            " [{peer_id}] (File) Recv chunk {chunk_index} for '{file_name}' ({} bytes)",
-                            data.len()
-                        );
-                    }
-                    Message::PeerInfo {
-                        alias,
-                        capabilities,
-                    } => {
-                        println!(
-                            " [{peer_id}] (Identity Info) Node name: {alias}, Specs: {capabilities:?}"
-                        );
-                    }
-                    Message::ServiceDiscovery { service_type } => {
-                        println!(
-                            " [{peer_id}] (Discovery Scan) Requesting matches for: {service_type}"
-                        );
-                    }
-                    Message::RPC { method, params } => {
-                        println!(
-                            " [{peer_id}] (RPC Invocation) Call: {method} with params: {params:?}"
-                        );
-                    }
-                },
-                Err(_) => {
-                    println!(
-                        " [{peer_id}] Received untyped binary text chunk: {}",
-                        String::from_utf8_lossy(&message.data)
-                    );
+            println!("Gossipsub: peer {peer_id} subscribed to {topic}");
+        }
+        SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed {
+            peer_id,
+            topic,
+        })) => {
+            println!("Gossipsub: peer {peer_id} unsubscribed from {topic}");
+        }
+
+        // --- Core Application Protocol (Direct Request-Response Interceptions) ---
+        SwarmEvent::Behaviour(MyBehaviourEvent::DirectMessaging(
+            request_response::Event::Message {
+                peer: peer_id,
+                message,
+            },
+        )) => {
+            match message {
+                // Occurs when another single peer dials and passes a direct request payload down to us
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    display_received_message("Direct Point-To-Point", peer_id, request.clone());
+
+                    // Send an explicit acknowledgement receipt back to complete the round-trip transaction handshake
+                    let response_receipt =
+                        Message::Chat("ACK: Message delivered directly.".to_string());
+                    let _ = swarm
+                        .behaviour_mut()
+                        .direct_messaging
+                        .send_response(channel, response_receipt);
+                }
+                // Occurs when we receive the response back from a request we originally sent out
+                request_response::Message::Response { response, .. } => {
+                    display_received_message("Direct Receipt Confirmation", peer_id, response);
                 }
             }
         }
 
+        // --- Identity & Routing Engine Layer Updates ---
         SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
             info,
             ..
         })) => {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .add_explicit_peer(&peer_id);
             for addr in info.listen_addrs {
                 swarm
                     .behaviour_mut()
@@ -398,6 +442,80 @@ fn handle_swarm_event(
                     eprintln!("Database write failure: {e}");
                 }
             }
+        }
+        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+            for (peer_id, addr) in list {
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .add_explicit_peer(&peer_id);
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
+                if let Err(e) = db.save_peer(&peer_id, &addr) {
+                    eprintln!("Database write failure: {e}");
+                }
+                println!("mDNS discovered peer {peer_id} at {addr}");
+            }
+        }
+        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+            for (peer_id, _addr) in list {
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .remove_explicit_peer(&peer_id);
+            }
+        }
+
+        // --- Automatic Direct P2P Holepunching (DCUTR Tracking) ---
+        // --- Automatic Direct P2P Holepunching (DCUTR Tracking) ---
+        SwarmEvent::Behaviour(MyBehaviourEvent::Dcutr(libp2p::dcutr::Event {
+            remote_peer_id,
+            result,
+        })) => match result {
+            Ok(_) => println!("==> Hole punch succeeded with peer: {remote_peer_id}!"),
+            Err(error) => {
+                eprintln!("==> Hole punch failed with peer {remote_peer_id}. Reason: {error:?}")
+            }
+        },
+
+        SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } => {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .add_explicit_peer(&peer_id);
+            let direct_type = if endpoint.is_dialer() {
+                "Outbound"
+            } else {
+                "Inbound"
+            };
+            println!(
+                "    Connection established directly ({direct_type}) with: {peer_id} via {}",
+                endpoint.get_remote_address()
+            );
+        }
+        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .remove_explicit_peer(&peer_id);
+            println!("    Connection closed with: {peer_id}");
+        }
+        SwarmEvent::OutgoingConnectionError {
+            peer_id,
+            error,
+            ..
+        } => {
+            match peer_id {
+                Some(peer_id) => eprintln!("Dial failed for peer {peer_id}: {error}"),
+                None => eprintln!("Dial failed: {error}"),
+            }
+        }
+        SwarmEvent::NewListenAddr { address, .. } => {
+            println!("Listening on {address}");
         }
 
         SwarmEvent::Behaviour(MyBehaviourEvent::RelayServer(
@@ -413,5 +531,40 @@ fn handle_swarm_event(
             );
         }
         _ => {}
+    }
+}
+
+// Small formatting helper helper utility function
+fn display_received_message(source_context: &str, peer_id: libp2p::PeerId, msg: Message) {
+    match msg {
+        Message::Chat(text) => println!(" [{peer_id}] ({source_context} - Chat): {text}"),
+        Message::FileChunk {
+            file_name,
+            chunk_index,
+            data,
+        } => {
+            println!(
+                " [{peer_id}] ({source_context} - File) Chunk {chunk_index} for '{file_name}' ({} bytes)",
+                data.len()
+            );
+        }
+        Message::PeerInfo {
+            alias,
+            capabilities,
+        } => {
+            println!(
+                " [{peer_id}] ({source_context} - Metadata) Node: {alias}, Specs: {capabilities:?}"
+            );
+        }
+        Message::ServiceDiscovery { service_type } => {
+            println!(
+                " [{peer_id}] ({source_context} - Discovery) Target scan type: {service_type}"
+            );
+        }
+        Message::RPC { method, params } => {
+            println!(
+                " [{peer_id}] ({source_context} - RPC) Executing method '{method}' args: {params:?}"
+            );
+        }
     }
 }

@@ -5,7 +5,7 @@ edition = "2024"
 
 
 [dependencies]
-libp2p = { version = "0.54", features = ["gossipsub", "mdns", "tcp", "macros", "tokio", "noise", "yamux", "quic", "dcutr", "identify", "kad","autonat","relay"] }
+libp2p = { version = "0.54", features = ["gossipsub", "mdns", "tcp", "macros", "tokio", "noise", "yamux", "quic", "dcutr", "identify", "kad","autonat","relay","request-response", "cbor"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 libc = "0.2"
@@ -18,19 +18,3 @@ directories = "5.0"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
 
-[mounts]
-  source = "chat_db_volume"
-  destination = "/data"
-[[services]]
-  internal_port = 8500
-  protocol = "tcp"
-
-  [[services.ports]]
-    port = 8500
-
-[[services]]
-  internal_port = 8500
-  protocol = "udp"
-
-  [[services.ports]]
-    port = 8500
