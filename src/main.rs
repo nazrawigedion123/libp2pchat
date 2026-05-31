@@ -5,10 +5,11 @@ use db::PeerStorage;
 use directories::ProjectDirs;
 use futures::stream::StreamExt;
 use libp2p::{
-    Swarm, Transport, autonat, dcutr, gossipsub, identify, kad, mdns, noise, relay,
+    autonat, dcutr, gossipsub, identify, kad, mdns, noise, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
+    tcp, yamux, Swarm, Transport,
 };
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::raw::c_char;
 use std::path::PathBuf;
@@ -22,6 +23,28 @@ unsafe extern "C" {
     fn StartDirectVPNTunnel(local_port: i32, public_listen_port: i32, remote_addr: *const c_char);
 }
 
+// --- Application Protocol Schema Definition ---
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum Message {
+    Chat(String),
+    FileChunk {
+        file_name: String,
+        chunk_index: u64,
+        data: Vec<u8>,
+    },
+    PeerInfo {
+        alias: String,
+        capabilities: Vec<String>,
+    },
+    ServiceDiscovery {
+        service_type: String,
+    },
+    RPC {
+        method: String,
+        params: Vec<String>,
+    },
+}
+
 #[derive(NetworkBehaviour)]
 struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
@@ -29,9 +52,9 @@ struct MyBehaviour {
     identify: identify::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     dcutr: dcutr::Behaviour,
-    relay_server: relay::Behaviour, // Enables acting as a relay node
-    relay_client: relay::client::Behaviour, // Enables connecting through relay nodes
-    autonat: autonat::Behaviour,    // Helps discover public network status
+    relay_server: relay::Behaviour,
+    relay_client: relay::client::Behaviour,
+    autonat: autonat::Behaviour,
 }
 
 struct AppConfig {
@@ -78,6 +101,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         old_peers.len()
     );
     for (peer_id, addr) in old_peers {
+        // Skip malformed circuit proxies to avoid triggering MissingDstPeerId
+        if addr.to_string().contains("/p2p-circuit") && !addr.to_string().contains("/p2p/") {
+            continue;
+        }
         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
     }
 
@@ -107,13 +134,11 @@ fn parse_args() -> AppConfig {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  As Bootstrap Node A:");
     eprintln!(
-        "    cargo run -- <node_name> <local_proxy_port> <public_listen_port> <remote_target_ip:port> bootstrap"
+        "  As Bootstrap Node A:\n    cargo run -- <node_name> <local_proxy_port> <public_listen_port> <remote_target_ip:port> bootstrap"
     );
-    eprintln!("  As Peer Node B:");
     eprintln!(
-        "    cargo run -- <node_name> <local_proxy_port> <public_listen_port> <remote_target_ip:port> /ip4/.../p2p/<BOOTSTRAP_PEER_ID>"
+        "  As Peer Node B:\n    cargo run -- <node_name> <local_proxy_port> <public_listen_port> <remote_target_ip:port> /ip4/.../p2p/<BOOTSTRAP_PEER_ID>"
     );
 }
 
@@ -133,11 +158,8 @@ fn start_go_vpn_tunnel(
 
 fn build_swarm(key: &libp2p::identity::Keypair) -> Result<Swarm<MyBehaviour>, Box<dyn Error>> {
     let local_peer_id = key.public().to_peer_id();
-
-    // 1. Create the relay client transport and behavior
     let (relay_transport, relay_behavior) = relay::client::new(local_peer_id);
 
-    // 2. Build the swarm and attach the authenticated relay transport
     let swarm = libp2p::SwarmBuilder::with_existing_identity(key.clone())
         .with_tokio()
         .with_tcp(
@@ -146,7 +168,6 @@ fn build_swarm(key: &libp2p::identity::Keypair) -> Result<Swarm<MyBehaviour>, Bo
             yamux::Config::default,
         )?
         .with_quic()
-        // FIX: Removed the `?` inside the closure and handled the noise configuration creation safely
         .with_other_transport(|key| {
             let noise_config = noise::Config::new(key)
                 .expect("Signing libp2p noise keypair failed; this should never happen");
@@ -161,6 +182,7 @@ fn build_swarm(key: &libp2p::identity::Keypair) -> Result<Swarm<MyBehaviour>, Bo
 
     Ok(swarm)
 }
+
 fn build_behaviour(
     key: &libp2p::identity::Keypair,
     relay_client: relay::client::Behaviour,
@@ -188,8 +210,6 @@ fn build_behaviour(
     let store = kad::store::MemoryStore::new(peer_id);
     let kademlia = kad::Behaviour::new(peer_id, store);
     let dcutr = dcutr::Behaviour::new(peer_id);
-
-    // Configure default server settings for our relay node runtime setup
     let relay_server = relay::Behaviour::new(peer_id, relay::Config::default());
     let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
 
@@ -224,11 +244,6 @@ fn listen_on_local_transports(
 
     swarm.listen_on(tcp_listen_multiaddr)?;
     swarm.listen_on(quic_listen_multiaddr)?;
-
-    // Only bind this if you are explicitly targeting an external known relay.
-    // If you run a direct VPN tunnel, comment this out to prevent unbound transport loop errors:
-    // swarm.listen_on("/p2p-circuit".parse()?)?;
-
     Ok(())
 }
 
@@ -236,9 +251,8 @@ fn configure_bootstrap(
     swarm: &mut Swarm<MyBehaviour>,
     bootstrap_mode: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    match bootstrap_mode {
-        Some("bootstrap") => {}
-        Some(addr_str) => {
+    if let Some(addr_str) = bootstrap_mode {
+        if addr_str != "bootstrap" {
             let bootstrap_addr: libp2p::Multiaddr = addr_str.parse()?;
             if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) = bootstrap_addr.iter().last() {
                 swarm
@@ -247,15 +261,11 @@ fn configure_bootstrap(
                     .add_address(&peer_id, bootstrap_addr.clone());
                 swarm.behaviour_mut().kademlia.bootstrap()?;
             } else {
-                eprintln!(
-                    "Error: Provided bootstrap multiaddress must contain the trailing /p2p/<PeerId>"
-                );
+                eprintln!("Error: Provided bootstrap multiaddress must contain the trailing /p2p/<PeerId>");
                 std::process::exit(1);
             }
         }
-        None => {}
     }
-
     Ok(())
 }
 
@@ -269,9 +279,38 @@ async fn run_chat_event_loop(
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
-                let _ = swarm
-                    .behaviour_mut().gossipsub
-                    .publish(topic.clone(), line.as_bytes());
+                // Parse commands to demonstrate all protocol message variants, defaulting to Chat
+                let app_msg = if line.starts_with("/rpc ") {
+                    Message::RPC {
+                        method: line.trim_start_matches("/rpc ").to_string(),
+                        params: vec!["param1".to_string()],
+                    }
+                } else if line.starts_with("/file ") {
+                    Message::FileChunk {
+                        file_name: line.trim_start_matches("/file ").to_string(),
+                        chunk_index: 0,
+                        data: b"raw binary chunk payload mock".to_vec(),
+                    }
+                } else if line == "/discovery" {
+                    Message::ServiceDiscovery { service_type: "vpn-node".to_string() }
+                } else if line == "/info" {
+                    Message::PeerInfo {
+                        alias: "RustNode".to_string(),
+                        capabilities: vec!["Gossip".to_string(), "Relay".to_string()],
+                    }
+                } else {
+                    Message::Chat(line)
+                };
+
+                // Serialize using bincode to convert our Message enum to a byte stream
+                match bincode::serialize(&app_msg) {
+                    Ok(encoded_bytes) => {
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded_bytes) {
+                            eprintln!("Publish error: {e:?}");
+                        }
+                    }
+                    Err(e) => eprintln!("Serialization error: {e}"),
+                }
             }
             event = swarm.select_next_some() => handle_swarm_event(&mut swarm, event, &db)
         }
@@ -289,7 +328,29 @@ fn handle_swarm_event(
             message,
             ..
         })) => {
-            println!("[{}] {}", peer_id, String::from_utf8_lossy(&message.data));
+            // Deserialize bytes back into our structured Message enum
+            match bincode::deserialize::<Message>(&message.data) {
+                Ok(app_message) => match app_message {
+                    Message::Chat(text) => {
+                        println!(" [{peer_id}] (Chat): {text}");
+                    }
+                    Message::FileChunk { file_name, chunk_index, data } => {
+                        println!(" [{peer_id}] (File) Recv chunk {chunk_index} for '{file_name}' ({} bytes)", data.len());
+                    }
+                    Message::PeerInfo { alias, capabilities } => {
+                        println!(" [{peer_id}] (Identity Info) Node name: {alias}, Specs: {capabilities:?}");
+                    }
+                    Message::ServiceDiscovery { service_type } => {
+                        println!(" [{peer_id}] (Discovery Scan) Requesting matches for: {service_type}");
+                    }
+                    Message::RPC { method, params } => {
+                        println!(" [{peer_id}] (RPC Invocation) Call: {method} with params: {params:?}");
+                    }
+                },
+                Err(_) => {
+                    println!(" [{peer_id}] Received untyped binary text chunk: {}", String::from_utf8_lossy(&message.data));
+                }
+            }
         }
 
         SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received {
@@ -308,7 +369,6 @@ fn handle_swarm_event(
             }
         }
 
-        // Handle Relay occurrences
         SwarmEvent::Behaviour(MyBehaviourEvent::RelayServer(
             relay::Event::ReservationReqAccepted { src_peer_id, .. },
         )) => {
@@ -317,9 +377,7 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(MyBehaviourEvent::RelayClient(
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
         )) => {
-            println!(
-                "Relay client: Successfully registered reservation through proxy relay: {relay_peer_id}"
-            );
+            println!("Relay client: Successfully registered reservation through proxy relay: {relay_peer_id}");
         }
         _ => {}
     }
