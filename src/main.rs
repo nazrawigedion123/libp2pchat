@@ -5,9 +5,9 @@ use db::PeerStorage;
 use directories::ProjectDirs;
 use futures::stream::StreamExt;
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, noise, relay,
+    Swarm, Transport, autonat, dcutr, gossipsub, identify, kad, mdns, noise, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Swarm, Transport,
+    tcp, yamux,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -68,13 +68,23 @@ struct AppConfig {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = parse_args();
-
-    // 1. Setup isolation directories under ~/.myapp/<node_name>
-    let mut node_dir = ProjectDirs::from("", "", "myapp")
-        .map(|p| p.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    // In main.rs:
+    let mut node_dir = if std::env::var("FLY_APP_NAME").is_ok() {
+        PathBuf::from("/data") // Force production Fly.io volume path
+    } else {
+        ProjectDirs::from("", "", "myapp")
+            .map(|p| p.data_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
     node_dir.push(&config.node_name);
     fs::create_dir_all(&node_dir)?;
+
+    // // 1. Setup isolation directories under ~/.myapp/<node_name>
+    // let mut node_dir = ProjectDirs::from("", "", "myapp")
+    //     .map(|p| p.data_dir().to_path_buf())
+    //     .unwrap_or_else(|| PathBuf::from("."));
+    // node_dir.push(&config.node_name);
+    // fs::create_dir_all(&node_dir)?;
 
     // 2. Load or generate persistent identity
     let id_keys = identity::load_or_generate_identity(&node_dir)?;
@@ -261,7 +271,9 @@ fn configure_bootstrap(
                     .add_address(&peer_id, bootstrap_addr.clone());
                 swarm.behaviour_mut().kademlia.bootstrap()?;
             } else {
-                eprintln!("Error: Provided bootstrap multiaddress must contain the trailing /p2p/<PeerId>");
+                eprintln!(
+                    "Error: Provided bootstrap multiaddress must contain the trailing /p2p/<PeerId>"
+                );
                 std::process::exit(1);
             }
         }
@@ -334,21 +346,40 @@ fn handle_swarm_event(
                     Message::Chat(text) => {
                         println!(" [{peer_id}] (Chat): {text}");
                     }
-                    Message::FileChunk { file_name, chunk_index, data } => {
-                        println!(" [{peer_id}] (File) Recv chunk {chunk_index} for '{file_name}' ({} bytes)", data.len());
+                    Message::FileChunk {
+                        file_name,
+                        chunk_index,
+                        data,
+                    } => {
+                        println!(
+                            " [{peer_id}] (File) Recv chunk {chunk_index} for '{file_name}' ({} bytes)",
+                            data.len()
+                        );
                     }
-                    Message::PeerInfo { alias, capabilities } => {
-                        println!(" [{peer_id}] (Identity Info) Node name: {alias}, Specs: {capabilities:?}");
+                    Message::PeerInfo {
+                        alias,
+                        capabilities,
+                    } => {
+                        println!(
+                            " [{peer_id}] (Identity Info) Node name: {alias}, Specs: {capabilities:?}"
+                        );
                     }
                     Message::ServiceDiscovery { service_type } => {
-                        println!(" [{peer_id}] (Discovery Scan) Requesting matches for: {service_type}");
+                        println!(
+                            " [{peer_id}] (Discovery Scan) Requesting matches for: {service_type}"
+                        );
                     }
                     Message::RPC { method, params } => {
-                        println!(" [{peer_id}] (RPC Invocation) Call: {method} with params: {params:?}");
+                        println!(
+                            " [{peer_id}] (RPC Invocation) Call: {method} with params: {params:?}"
+                        );
                     }
                 },
                 Err(_) => {
-                    println!(" [{peer_id}] Received untyped binary text chunk: {}", String::from_utf8_lossy(&message.data));
+                    println!(
+                        " [{peer_id}] Received untyped binary text chunk: {}",
+                        String::from_utf8_lossy(&message.data)
+                    );
                 }
             }
         }
@@ -377,7 +408,9 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(MyBehaviourEvent::RelayClient(
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
         )) => {
-            println!("Relay client: Successfully registered reservation through proxy relay: {relay_peer_id}");
+            println!(
+                "Relay client: Successfully registered reservation through proxy relay: {relay_peer_id}"
+            );
         }
         _ => {}
     }
