@@ -5,7 +5,7 @@ use db::PeerStorage;
 use directories::ProjectDirs;
 use futures::stream::StreamExt;
 use libp2p::{
-    Swarm, dcutr, gossipsub, identify, kad, mdns, noise,
+    Swarm, Transport, autonat, dcutr, gossipsub, identify, kad, mdns, noise, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
@@ -29,10 +29,13 @@ struct MyBehaviour {
     identify: identify::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     dcutr: dcutr::Behaviour,
+    relay_server: relay::Behaviour, // Enables acting as a relay node
+    relay_client: relay::client::Behaviour, // Enables connecting through relay nodes
+    autonat: autonat::Behaviour,    // Helps discover public network status
 }
 
 struct AppConfig {
-    node_name: String, // e.g. "node1" or "node2"
+    node_name: String,
     local_proxy_port: i32,
     public_router_port: i32,
     remote_peer_internet_addr: String,
@@ -52,7 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 2. Load or generate persistent identity
     let id_keys = identity::load_or_generate_identity(&node_dir)?;
-    
+
     // 3. Initialize SQL storage
     let db = PeerStorage::init(&node_dir)?;
 
@@ -70,7 +73,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 5. Hydrate Kademlia routing table with peers saved inside peer.db
     let old_peers = db.load_all_peers()?;
-    println!("Loaded {} history peer connection(s) from SQL database.", old_peers.len());
+    println!(
+        "Loaded {} history peer connection(s) from SQL database.",
+        old_peers.len()
+    );
     for (peer_id, addr) in old_peers {
         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
     }
@@ -120,16 +126,18 @@ fn start_go_vpn_tunnel(
         let c_remote_addr =
             CString::new(remote_peer_internet_addr).expect("Invalid CString conversion");
         unsafe {
-            StartDirectVPNTunnel(
-                local_proxy_port,
-                public_router_port,
-                c_remote_addr.as_ptr(),
-            );
+            StartDirectVPNTunnel(local_proxy_port, public_router_port, c_remote_addr.as_ptr());
         }
     });
 }
 
 fn build_swarm(key: &libp2p::identity::Keypair) -> Result<Swarm<MyBehaviour>, Box<dyn Error>> {
+    let local_peer_id = key.public().to_peer_id();
+
+    // 1. Create the relay client transport and behavior
+    let (relay_transport, relay_behavior) = relay::client::new(local_peer_id);
+
+    // 2. Build the swarm and attach the authenticated relay transport
     let swarm = libp2p::SwarmBuilder::with_existing_identity(key.clone())
         .with_tokio()
         .with_tcp(
@@ -138,14 +146,24 @@ fn build_swarm(key: &libp2p::identity::Keypair) -> Result<Swarm<MyBehaviour>, Bo
             yamux::Config::default,
         )?
         .with_quic()
-        .with_behaviour(|k| build_behaviour(k))?
+        // FIX: Removed the `?` inside the closure and handled the noise configuration creation safely
+        .with_other_transport(|key| {
+            let noise_config = noise::Config::new(key)
+                .expect("Signing libp2p noise keypair failed; this should never happen");
+
+            relay_transport
+                .upgrade(libp2p::core::upgrade::Version::V1)
+                .authenticate(noise_config)
+                .multiplex(yamux::Config::default())
+        })?
+        .with_behaviour(|_k| build_behaviour(key, relay_behavior))?
         .build();
 
     Ok(swarm)
 }
-
 fn build_behaviour(
     key: &libp2p::identity::Keypair,
+    relay_client: relay::client::Behaviour,
 ) -> Result<MyBehaviour, Box<dyn Error + Send + Sync>> {
     let peer_id = key.public().to_peer_id();
 
@@ -171,12 +189,19 @@ fn build_behaviour(
     let kademlia = kad::Behaviour::new(peer_id, store);
     let dcutr = dcutr::Behaviour::new(peer_id);
 
+    // Configure default server settings for our relay node runtime setup
+    let relay_server = relay::Behaviour::new(peer_id, relay::Config::default());
+    let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
+
     Ok(MyBehaviour {
         gossipsub,
         mdns,
         identify,
         kademlia,
         dcutr,
+        relay_server,
+        relay_client,
+        autonat,
     })
 }
 
@@ -196,8 +221,14 @@ fn listen_on_local_transports(
         format!("/ip4/127.0.0.1/tcp/{}", local_proxy_port).parse()?;
     let quic_listen_multiaddr: libp2p::Multiaddr =
         format!("/ip4/127.0.0.1/udp/{}/quic-v1", local_proxy_port).parse()?;
+
     swarm.listen_on(tcp_listen_multiaddr)?;
     swarm.listen_on(quic_listen_multiaddr)?;
+
+    // Only bind this if you are explicitly targeting an external known relay.
+    // If you run a direct VPN tunnel, comment this out to prevent unbound transport loop errors:
+    // swarm.listen_on("/p2p-circuit".parse()?)?;
+
     Ok(())
 }
 
@@ -246,7 +277,12 @@ async fn run_chat_event_loop(
         }
     }
 }
-fn handle_swarm_event(swarm: &mut Swarm<MyBehaviour>, event: SwarmEvent<MyBehaviourEvent>, db: &PeerStorage) {
+
+fn handle_swarm_event(
+    swarm: &mut Swarm<MyBehaviour>,
+    event: SwarmEvent<MyBehaviourEvent>,
+    db: &PeerStorage,
+) {
     match event {
         SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source: peer_id,
@@ -256,18 +292,34 @@ fn handle_swarm_event(swarm: &mut Swarm<MyBehaviour>, event: SwarmEvent<MyBehavi
             println!("[{}] {}", peer_id, String::from_utf8_lossy(&message.data));
         }
 
-        // Added `connection_id` (ignored via `..`) to match the updated enum variant structure
-        SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { 
-            peer_id, 
+        SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
             info,
-            .. // This implicitly handles connection_id and any future fields
+            ..
         })) => {
             for addr in info.listen_addrs {
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
                 if let Err(e) = db.save_peer(&peer_id, &addr) {
                     eprintln!("Database write failure: {e}");
                 }
             }
+        }
+
+        // Handle Relay occurrences
+        SwarmEvent::Behaviour(MyBehaviourEvent::RelayServer(
+            relay::Event::ReservationReqAccepted { src_peer_id, .. },
+        )) => {
+            println!("Relay server: Accepted reservation request from peer: {src_peer_id}");
+        }
+        SwarmEvent::Behaviour(MyBehaviourEvent::RelayClient(
+            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
+        )) => {
+            println!(
+                "Relay client: Successfully registered reservation through proxy relay: {relay_peer_id}"
+            );
         }
         _ => {}
     }
