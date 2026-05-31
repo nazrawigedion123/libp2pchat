@@ -1,7 +1,9 @@
 use libp2p::{Multiaddr, PeerId};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 use std::str::FromStr;
+
+use super::sqlite;
 
 pub struct PeerStorage {
     conn: Connection,
@@ -9,10 +11,8 @@ pub struct PeerStorage {
 
 impl PeerStorage {
     pub fn init(node_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let db_path = node_dir.join("peer.db");
-        let conn = Connection::open(db_path)?;
+        let conn = sqlite::open(node_dir)?;
 
-        // Create table for known multiaddresses linked to peer IDs
         conn.execute(
             "CREATE TABLE IF NOT EXISTS routing_table (
                 peer_id TEXT PRIMARY KEY,
@@ -33,7 +33,9 @@ impl PeerStorage {
     }
 
     pub fn load_all_peers(&self) -> Result<Vec<(PeerId, Multiaddr)>, Box<dyn std::error::Error>> {
-        let mut stmt = self.conn.prepare("SELECT peer_id, address FROM routing_table")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT peer_id, address FROM routing_table")?;
         let peer_iter = stmt.query_map([], |row| {
             let pid_str: String = row.get(0)?;
             let addr_str: String = row.get(1)?;
@@ -43,7 +45,9 @@ impl PeerStorage {
         let mut results = Vec::new();
         for peer_res in peer_iter {
             let (pid_str, addr_str) = peer_res?;
-            if let (Ok(peer_id), Ok(addr)) = (PeerId::from_str(&pid_str), Multiaddr::from_str(&addr_str)) {
+            if let (Ok(peer_id), Ok(addr)) =
+                (PeerId::from_str(&pid_str), Multiaddr::from_str(&addr_str))
+            {
                 results.push((peer_id, addr));
             }
         }
