@@ -1,13 +1,15 @@
 use libp2p::{dcutr, gossipsub, identify, mdns, relay, request_response, swarm::SwarmEvent};
 
-use crate::{protocol, protocol::Message, storage::PeerStorage};
+use crate::{
+    protocol, protocol::Message,
+    services::peers::PeerService,
+};
 
-use super::{behaviour::MyBehaviour, swarm::P2PNode};
+use super::behaviour::MyBehaviour;
 
 pub fn handle_swarm_event(
-    node: &mut P2PNode,
+    peer_svc: &mut PeerService,
     event: SwarmEvent<<MyBehaviour as libp2p::swarm::NetworkBehaviour>::ToSwarm>,
-    db: &PeerStorage,
 ) {
     match event {
         SwarmEvent::Behaviour(super::behaviour::MyBehaviourEvent::Gossipsub(
@@ -46,11 +48,7 @@ pub fn handle_swarm_event(
 
                 let response_receipt =
                     Message::Chat("ACK: Message delivered directly.".to_string());
-                let _ = node
-                    .swarm
-                    .behaviour_mut()
-                    .direct_messaging
-                    .send_response(channel, response_receipt);
+                let _ = peer_svc.send_direct_response(channel, response_receipt);
             }
             request_response::Message::Response { response, .. } => {
                 display_received_message("Direct Receipt Confirmation", peer_id, response);
@@ -60,23 +58,13 @@ pub fn handle_swarm_event(
         SwarmEvent::Behaviour(super::behaviour::MyBehaviourEvent::Identify(
             identify::Event::Received { peer_id, info, .. },
         )) => {
-            node.add_explicit_peer(&peer_id);
-            for addr in info.listen_addrs {
-                node.add_peer_address(peer_id, addr.clone());
-                if let Err(e) = db.save_peer(&peer_id, &addr) {
-                    eprintln!("Database write failure: {e}");
-                }
-            }
+            peer_svc.on_peer_discovered(peer_id, info.listen_addrs);
         }
         SwarmEvent::Behaviour(super::behaviour::MyBehaviourEvent::Mdns(
             mdns::Event::Discovered(list),
         )) => {
             for (peer_id, addr) in list {
-                node.add_explicit_peer(&peer_id);
-                node.add_peer_address(peer_id, addr.clone());
-                if let Err(e) = db.save_peer(&peer_id, &addr) {
-                    eprintln!("Database write failure: {e}");
-                }
+                peer_svc.on_peer_discovered(peer_id, vec![addr.clone()]);
                 println!("mDNS discovered peer {peer_id} at {addr}");
             }
         }
@@ -84,7 +72,7 @@ pub fn handle_swarm_event(
             list,
         ))) => {
             for (peer_id, _addr) in list {
-                node.remove_explicit_peer(&peer_id);
+                peer_svc.on_peer_disconnected(peer_id);
             }
         }
 
@@ -101,7 +89,7 @@ pub fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
-            node.add_explicit_peer(&peer_id);
+            peer_svc.on_peer_connected(peer_id);
             let direct_type = if endpoint.is_dialer() {
                 "Outbound"
             } else {
@@ -113,7 +101,7 @@ pub fn handle_swarm_event(
             );
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            node.remove_explicit_peer(&peer_id);
+            peer_svc.on_peer_disconnected(peer_id);
             println!("    Connection closed with: {peer_id}");
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {

@@ -9,6 +9,7 @@ use tokio::{
 use crate::{
     identity,
     protocol::{self, Message},
+    services::peers::PeerService,
     storage::PeerStorage,
 };
 
@@ -121,7 +122,10 @@ impl P2PNode {
         loop {
             select! {
                 Ok(Some(line)) = stdin.next_line() => self.handle_input(line),
-                event = self.swarm.select_next_some() => events::handle_swarm_event(&mut self, event, &db)
+                event = self.swarm.select_next_some() => {
+                    let mut peer_svc = PeerService::new(&mut self, &db);
+                    events::handle_swarm_event(&mut peer_svc, event);
+                }
             }
         }
     }
