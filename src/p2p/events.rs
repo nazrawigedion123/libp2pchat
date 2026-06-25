@@ -1,14 +1,15 @@
-use libp2p::{dcutr, gossipsub, identify, mdns, relay, request_response, swarm::SwarmEvent};
+use libp2p::{dcutr, gossipsub, identify, mdns, request_response, swarm::SwarmEvent};
 
 use crate::{
     protocol, protocol::Message,
     services::peers::PeerService,
 };
 
-use super::behaviour::MyBehaviour;
+use super::{behaviour::MyBehaviour, relay::RelayManager};
 
 pub fn handle_swarm_event(
     peer_svc: &mut PeerService,
+    relay_mgr: &mut RelayManager,
     event: SwarmEvent<<MyBehaviour as libp2p::swarm::NetworkBehaviour>::ToSwarm>,
 ) {
     match event {
@@ -112,17 +113,11 @@ pub fn handle_swarm_event(
             println!("Listening on {address}");
         }
 
-        SwarmEvent::Behaviour(super::behaviour::MyBehaviourEvent::RelayServer(
-            relay::Event::ReservationReqAccepted { src_peer_id, .. },
-        )) => {
-            println!("Relay server: Accepted reservation request from peer: {src_peer_id}");
+        SwarmEvent::Behaviour(super::behaviour::MyBehaviourEvent::RelayServer(event)) => {
+            relay_mgr.handle_server_event(event);
         }
-        SwarmEvent::Behaviour(super::behaviour::MyBehaviourEvent::RelayClient(
-            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
-        )) => {
-            println!(
-                "Relay client: Successfully registered reservation through proxy relay: {relay_peer_id}"
-            );
+        SwarmEvent::Behaviour(super::behaviour::MyBehaviourEvent::RelayClient(event)) => {
+            relay_mgr.handle_client_event(event);
         }
         SwarmEvent::Dialing { peer_id, .. } => {
             if let Some(peer_id) = peer_id {
